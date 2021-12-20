@@ -25,6 +25,22 @@ class PixelEncoder(nn.Module):
         return x
     
     
+class ClusteringHead(nn.Module):
+    
+    def __init__(self, input_dim, hidden_dim, n_clusters):
+        super(ClusteringHead, self).__init__()
+        self.head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_clusters)
+        )
+    
+    def forward(self, x):
+        logits = self.head(x)
+        probs = F.softmax(logits, -1)
+        return probs
+        
+    
 class QNetwork(nn.Module):
     
     def __init__(self, input_ch, enc_hidden_ch, enc_fdim, q_hidden_dim, n_actions):
