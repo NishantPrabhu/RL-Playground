@@ -370,10 +370,13 @@ class AttentionDQN:
         self.optim = optim.Adam(self.online_q.parameters(), lr=learning_rate)
         
         if encoder_init_type == 'normal':
-            self.enc_buffer = networks.QNetwork(input_ch, enc_hidden_ch, enc_fdim, q_hidden_dim, n_actions)
+            self.enc_buffer = networks.QNetwork(input_ch, enc_hidden_ch, enc_fdim, q_hidden_dim, n_actions).to(self.device)
         elif encoder_init_type == 'dueling':
-            self.enc_buffer = networks.DuelQNetwork(input_ch, enc_hidden_ch, enc_fdim, q_hidden_dim, n_actions)
-        self.enc_init_ckpt_dir = encoder_init_ckpt_dir
+            self.enc_buffer = networks.DuelQNetwork(input_ch, enc_hidden_ch, enc_fdim, q_hidden_dim, n_actions).to(self.device)
+        
+        if encoder_init_ckpt_dir is not None:
+            self.init_encoder(encoder_init_ckpt_dir)
+        
         for p in self.enc_buffer.parameters():
             p.requires_grad = False
                     
@@ -397,14 +400,14 @@ class AttentionDQN:
         else:
             raise FileNotFoundError(f'Could not find model checkpoint at {ckpt_dir}')
         
-    def init_encoder(self):
-        file = os.path.join(self.enc_init_ckpt_dir, 'ckpt.pth')
+    def init_encoder(self, enc_init_ckpt_dir):
+        file = os.path.join(enc_init_ckpt_dir, 'ckpt.pth')
         if os.path.exists(file):
             state = torch.load(file, map_location=self.device)
             self.enc_buffer.load_state_dict(state['model_state'])
             self.online_q.load_encoder(self.enc_buffer)
         else:
-            raise FileNotFoundError(f'Could not find model checkpoint at {self.enc_init_ckpt_dir}')
+            raise FileNotFoundError(f'Could not find model checkpoint at {enc_init_ckpt_dir}')
             
     def update_epsilon(self):
         new_eps = self.eps_max - self.step * self.eps_decay_rate
@@ -425,10 +428,11 @@ class AttentionDQN:
         return obs
     
     def loss_fn(self, output, target):
-        output = F.normalize(output, p=2, dim=1)
-        target = F.normalize(target, p=2, dim=1)
-        loss = F.mse_loss(output, target)
-        return loss
+        output = F.softmax(output, dim=1)
+        target = target.argmax(dim=1)
+        loss = F.cross_entropy(output, target)
+        acc = torch.eq(output.argmax(1), target).sum().item() / target.size(0)
+        return loss, acc
             
     def select_action(self, obs):
         obs = self.preprocess_obs(obs)
@@ -458,14 +462,14 @@ class AttentionDQN:
             trg_q, _, _ = self.enc_buffer(obs) 
         
         pred_q, _, _, attn_probs = self.online_q(obs)
-        loss = F.loss_fn(pred_q, trg_q)
+        loss, acc = self.loss_fn(pred_q, trg_q)
         
         self.optim.zero_grad()
         loss.backward()
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.online_q.parameters(), self.max_grad_norm)
         self.optim.step()
-        return loss.item(), attn_probs
+        return loss.item(), acc, attn_probs
     
     
 class VectorizedActionDQN:

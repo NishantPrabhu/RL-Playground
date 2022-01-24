@@ -2,6 +2,7 @@
 import os
 import cv2
 import time
+import math
 import wandb 
 import torch
 import random
@@ -10,6 +11,8 @@ import numpy as np
 import pandas as pd
 import vizdoom as vzd
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 
 from envs import env
 from agents import dqn 
@@ -32,7 +35,7 @@ class Trainer:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         
-        self.env, self.actions = env.VizdoomEnv(
+        self.env, self.actions, self.action_names = env.VizdoomEnv(
             name=args.expt_name, 
             screen_format=args.screen_format,
             screen_res=args.screen_res
@@ -243,7 +246,7 @@ class ClusteringTrainer:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         
-        self.env, self.actions = env.VizdoomEnv(
+        self.env, self.actions, self.action_names = env.VizdoomEnv(
             name=args.expt_name, 
             screen_format=args.screen_format,
             screen_res=args.screen_res
@@ -464,16 +467,16 @@ class AttentionTrainer:
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
         
-        self.env, self.actions = env.VizdoomEnv(
+        self.env, self.actions, self.action_names = env.VizdoomEnv(
             name=args.expt_name,
             screen_format=args.screen_format,
             screen_res=args.screen_res
         )
-        self.action_size = len(self.actions)
+        self.n_actions = len(self.actions)
         
         self.agent = dqn.AttentionDQN(
-            input_ch=args.input_ch, 
-            n_actions=len(self.actions), 
+            input_ch=args.frame_stack, 
+            n_actions=self.n_actions, 
             input_res=(args.frame_height, args.frame_width),
             enc_hidden_ch=args.enc_hidden_ch,
             enc_fdim=args.enc_fdim,
@@ -520,6 +523,8 @@ class AttentionTrainer:
         self.batch_size = self.args.batch_size
         self.best_train, self.best_val = 0, 0
         self.best_loss = float('inf')
+        self.n_heads = args.n_attn_heads
+        self.n_layers = args.n_attn_layers
         
     def _warp(self, frames):
         if frames[0].ndim == 2:
@@ -538,7 +543,7 @@ class AttentionTrainer:
             if self.args.load is not None or self.args.resume is not None:
                 action = self.agent.select_agent_action(obs)
             else:
-                action = random.choice(np.arange(self.action_size))
+                action = random.choice(np.arange(self.n_actions))
             reward = self.env.make_action(self.actions[action], self.args.frame_skip)
             done = int(self.env.is_episode_finished())
             if not done:
@@ -574,13 +579,13 @@ class AttentionTrainer:
             
             if step % self.args.mem_replay_interval == 0:
                 batch = self.memory.get_batch(self.batch_size)
-                loss, _ = self.agent.learn_from_memory(batch)
-                meter.add({'AL': loss})
+                loss, acc, _ = self.agent.learn_from_memory(batch)
+                meter.add({'AL': loss, 'Acc': acc})
 
         if episode % self.args.log_interval == 0:
             self.logger.record("E: {:7d} |{}".format(episode, meter.msg()), mode='train')
         if self.log_wandb:
-            wandb.log({'episode': episode, 'train_loss': meter.get()['AL']})
+            wandb.log({'episode': episode, 'train_loss': meter.get()['AL'], 'train_acc': meter.get()['Acc']})
             
     @torch.no_grad()
     def evaluate(self, episode):
@@ -606,17 +611,17 @@ class AttentionTrainer:
                 obs = self.agent.preprocess_obs(obs)
                 trg_q, _, _ = self.agent.enc_buffer(obs)
                 pred_q, _, _, _ = self.agent.online_q(obs)
-                loss = self.agent.loss_fn(pred_q, trg_q)
-                meter.add({'AL': loss.item()})
+                loss, acc = self.agent.loss_fn(pred_q, trg_q)
+                meter.add({'AL': loss.item(), 'Acc': acc})
                          
-        avg_loss = meter.get()['AL']     
-        self.logger.record("E: {:7d} | AL: {:.4f}".format(episode, avg_loss), mode='val')
+        avg_loss, avg_acc = meter.get()['AL'], meter.get()['Acc']     
+        self.logger.record("E: {:7d} | AL: {:.4f} | Acc: {:.4f} |".format(episode, avg_loss, avg_acc), mode='val')
         if avg_loss < self.best_loss:
             self.best_loss = avg_loss
             self.agent.save(self.out_dir)
         
         if self.log_wandb:
-            wandb.log({'episode': episode, 'val_loss': avg_loss})
+            wandb.log({'episode': episode, 'val_loss': avg_loss, 'val_acc': avg_acc})
     
     def run(self):
         self.logger.print('Initializing memory', mode='info')            
@@ -655,7 +660,73 @@ class AttentionTrainer:
             
         self.env.close()
         
+    def gather_attn_maps(self, attn_probs, interpolate_size=None):
+        n_patches = attn_probs['layer0'][:, :, :, 1:-self.n_actions].size(-1)
+        sidelen = math.sqrt(n_patches)
+        assert int(sidelen) == sidelen, f'Attn of size {attn_probs["layer0"][:, :, :, 1:-self.n_actions]}'
         
+        layer_action_attn = {}
+        for lname, attn in attn_probs.items():
+            action_attn = attn[:, :, -self.n_actions:, 1:-self.n_actions]
+            layer_action_attn[lname] = {}
+            for i in range(self.n_actions):
+                attn_map = action_attn[:, :, i, :].view(1, self.n_heads, int(sidelen), int(sidelen))
+                attn_map = F.interpolate(attn_map, interpolate_size, mode='bilinear', align_corners=False)
+                layer_action_attn[lname][i] = attn_map.squeeze(0).detach().cpu().numpy()
+        return layer_action_attn
+    
+    @torch.no_grad()
+    def show_attention_on_frames(self, layer=None):
+        if layer is not None:
+            assert layer in range(self.n_layers), f'Invalid layer index, should be in {[i for i in range(self.n_layers)]}'
+        else:
+            layer = self.n_layers - 1
+        
+        self.agent.trainable(False)
+        self.env.set_mode(vzd.Mode.ASYNC_PLAYER)
+        self.env.set_screen_format(vzd.ScreenFormat.GRAY8)
+        self.env.init()
+        
+        frame_shape = self.env.get_state().screen_buffer.shape
+        resolution = (frame_shape[0], frame_shape[1])
+
+        fig, axarr = plt.subplots(self.n_actions, self.n_heads+1, figsize=(30, 25))
+        img_list = []
+        
+        for ep in range(self.args.spectator_episodes):
+            self.env.new_episode()
+            steps_taken = 0
+            while not self.env.is_episode_finished():
+                raw_frames = [self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)]
+                frames = self._warp(raw_frames)
+                action = self.agent.select_agent_action(frames)
+                reward = self.env.set_action(self.actions[action])
+                for _ in range(self.args.frame_skip):
+                    self.env.advance_action()
+                steps_taken += 1
+                
+                obs = self.agent.preprocess_obs(frames)
+                pred_q, _, _, attn_probs = self.agent.online_q(obs)
+                attn_probs = self.gather_attn_maps(attn_probs, resolution)
+                
+                temp_list = []
+                for action_id in range(self.n_actions):
+                    for head_id in range(self.n_heads+1):
+                        if head_id == 0:
+                            im = axarr[action_id, head_id].imshow(raw_frames[-1], cmap='gray')
+                            im = axarr[action_id, head_id].set_ylabel(self.action_names[action_id])
+                            axarr[action_id, head_id].axis('off')
+                        else:
+                            im = axarr[action_id, head_id].imshow(attn_probs[f'layer{layer}'][action_id][head_id-1], cmap='plasma', vmin=0, vmax=1)
+                            axarr[action_id, head_id].axis('off')
+                        temp_list.append(im)
+                img_list.append(temp_list)
+            print('Episode {:2d} | Steps: {:3d}'.format(ep, steps_taken))
+            
+        anim = animation.ArtistAnimation(fig, img_list, interval=10000, blit=True)
+        anim.save(os.path.join(self.out_dir, 'videos', 'attn_viz.mp4'), fps=5)
+
+
 class VectorizedActionTrainer:
     
     def __init__(self, args, seed=0):
@@ -670,7 +741,7 @@ class VectorizedActionTrainer:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         
-        self.env, self.actions = env.VizdoomEnv(
+        self.env, self.actions, self.action_names = env.VizdoomEnv(
             name=args.expt_name, 
             screen_format=args.screen_format,
             screen_res=args.screen_res
@@ -917,3 +988,7 @@ if __name__ == "__main__":
     elif args.task == 'embed':
         assert args.load is not None, 'Model checkpoint required for generating embeddings'
         trainer.generate_embeddings()
+        
+    elif args.task == 'attn_viz':
+        assert args.load is not None, 'Model checkpoint required for generating attention visualization'
+        trainer.show_attention_on_frames(args.viz_layer)

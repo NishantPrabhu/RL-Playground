@@ -49,7 +49,7 @@ def add_atari_args(parser):
 
 def add_vizdoom_args(parser):
     parser.add_argument('--expt_name', type=str, required=True, help='experiment name')
-    parser.add_argument('--task', type=str, required=True, choices=['train', 'record', 'embed'], help='whether to train or record')
+    parser.add_argument('--task', type=str, required=True, help='whether to train or record')
     parser.add_argument('--load', type=str, default=None, help='directory with model checkpoint to load')
     parser.add_argument('--resume', type=str, default=None, help='directory with model checkpoint to resume training from')
     parser.add_argument('--wandb', action='store_true', help='log metrics on wandb')
@@ -68,7 +68,7 @@ def add_vizdoom_args(parser):
     parser.add_argument('--q_hidden_dim', type=int, default=512, help='q network mlp hidden dim')
     parser.add_argument('--action_fdim', type=int, default=128, help='action embedding dim')
     parser.add_argument('--attn_model_dim', type=int, default=256, help='attention network mlp hidden dim')
-    parser.add_argument('--n_attn_heads', type=int, default=8, help='attention heads')
+    parser.add_argument('--n_attn_heads', type=int, default=4, help='attention heads')
     parser.add_argument('--n_attn_layers', type=int, default=4, help='attention encoder layers')
     parser.add_argument('--encoder_init_type', type=str, default='dueling', help='type of encoder to initialize attn model')
     parser.add_argument('--encoder_init_ckpt_dir', type=str, default=None, help='attn model encoder init ckpt dir')
@@ -93,4 +93,5 @@ def add_vizdoom_args(parser):
     parser.add_argument('--spectator_episodes', type=int, default=10, help='num episodes to record videos for')
     parser.add_argument('--eval_interval', type=int, default=1000, help='evaluation happens every this many episodes')
     parser.add_argument('--log_interval', type=int, default=5, help='logging to terminal happens every this many episodes')
+    parser.add_argument('--viz_layer', type=int, default=None, help='attention layer to visualize')
     return parser

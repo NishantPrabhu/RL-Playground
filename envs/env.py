@@ -38,5 +38,17 @@ def VizdoomEnv(name, screen_format='GRAY8', screen_res='RES_640X480'):
     env.init()
     
     n = env.get_available_buttons_size()
+    b_names = {i: str(env.get_available_buttons()[i]).split('.')[1] for i in range(n)}
     actions = [list(a) for a in it.product([0, 1], repeat=n)]
-    return env, actions
+    
+    action_names = {}
+    for i, a in enumerate(actions):
+        a_name = ''
+        for j in range(len(a)):
+            if a[j] == 1:
+                a_name += '{} '.format(b_names[j])
+        if len(a_name) == 0:
+            a_name = 'NO-OP'
+        action_names[i] = a_name
+
+    return env, actions, action_names

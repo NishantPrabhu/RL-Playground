@@ -118,19 +118,19 @@ class ViTEncoder(nn.Module):
         self.n_patches = n_patches
         self.img_input_dim = img_input_dim
         self.action_input_dim = action_input_dim
-        self.model_dim = (self.model_dim // self.n_heads) * self.n_heads 
+        self.model_dim = (model_dim // self.n_heads) * self.n_heads 
 
         self.img_upscale = nn.Linear(self.img_input_dim, self.model_dim, bias=False)
         self.action_upscale = nn.Linear(self.action_input_dim, self.model_dim, bias=False)
-        self.pos_embeds = nn.Embedding(self.n_patches, self.model_dim)
+        self.pos_embeds = nn.Embedding(self.n_patches+1, self.model_dim)
         self.enc_layers = nn.ModuleList([
             ViTLayer(self.n_heads, self.model_dim, self.model_dim * 2) for _ in range(self.n_layers)
         ])
         
     def add_embeddings(self, x, action_embeds):
         zeros = torch.zeros(x.size(0), 1, x.size(2)).float().to(x.device)
-        x = torch.cat([zeros, x], 1)
-        x = x + self.pos_embeds(torch.arange(self.n_patches+1).to(x.device))
+        pos_embed = self.pos_embeds(torch.arange(self.n_patches+1).to(x.device)).unsqueeze(0).repeat(x.size(0), 1, 1)
+        x = torch.cat([zeros, x], 1) + pos_embed
         x = torch.cat([x, action_embeds], 1)
         return x
         
@@ -262,7 +262,9 @@ class AttentionQNetwork(nn.Module):
         
     def forward(self, img):
         x = F.relu(self.encoder.conv1(img))
+        x = torch.flatten(x, 2).transpose(1, 2).contiguous()
         action_emb = self.action_embeds(torch.arange(self.n_actions).to(img.device))
+        action_emb = action_emb.unsqueeze(0).repeat(x.size(0), 1, 1)
         x, attn_probs = self.vit(x, action_emb)
         
         x_action = x[:, -self.n_actions:, :]
