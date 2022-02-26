@@ -136,7 +136,7 @@ class ConvBaseEncoder(nn.Module):
     def forward(self, inp):
         x = self.conv_base(inp)
         x = self.unfold(x).permute(0, 2, 1).contiguous()
-        x = self.embedding(self.upscale(x)) s
+        x = self.embedding(self.upscale(x))
         attn_probs = {}
         
         for i in range(self.n_layers):
