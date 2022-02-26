@@ -42,6 +42,7 @@ class Trainer:
         self.agent = agents.ViTDQN(
             input_shape=(args.frame_height, args.frame_width, args.frame_stack), 
             n_actions=self.env.action_space.n,
+            encoder_type=args.encoder_type,
             double_dqn=args.double_dqn,
             duel_dqn=args.duel_dqn,
             n_layers=args.n_layers,
@@ -101,9 +102,9 @@ class Trainer:
             loss = self.agent.experience_replay()
             total_loss += loss
             utils.pbar((step+1)/random_steps, desc="Learning", status='')
-        print()
+
         avg_loss = total_loss / random_steps
-        self.logger.record('Memory init: [loss] {:.4f} | [train_best] {}'.format(avg_loss, self.best_train), mode='train')
+        self.logger.record('Memory init: [loss] {:.4f} [train_best] {}'.format(avg_loss, self.best_train), mode='train')
         
     def train_episode(self, episode):
         self.agent.trainable(True)
@@ -133,12 +134,12 @@ class Trainer:
             self.best_train = round(total_reward)
             
         if episode % self.args.log_interval == 0:
-            self.logger.record("Episode: {:<7d} [reward] {:<5d} {} [train_best] {:<5d} [val_best] {:<5d}".format(
-                episode, round(total_reward), meter.msg(), round(self.best_train), round(self.best_val)),
+            self.logger.record("Episode: {:<7d} [reward] {:<5d} {} [train_best] {:<5d} [val_best] {:<5d} [eps] {:.4f}".format(
+                episode, round(total_reward), meter.msg(), round(self.best_train), round(self.best_val), self.agent.eps),
                 mode='train'
             )
         if self.log_wandb:
-            wandb.log({'episode': episode, 'reward': total_reward, **meter.get()})
+            wandb.log({'episode': episode, 'reward': total_reward, 'epsilon': self.agent.eps, **meter.get()})
 
     @torch.no_grad()
     def evaluate(self, episode):
@@ -166,7 +167,7 @@ class Trainer:
             self.best_val = round(avg_reward)
             self.agent.save(self.out_dir)
               
-        self.logger.record("Episode: {:<7d} [reward] {:<5d} [train_best] {:<5d} [val_best] {:<5d}".format(
+        self.logger.record("Episode: {:<7d} [reward] {:<5d} [loss] N/A    [train_best] {:<5d} [val_best] {:<5d}".format(
             episode, round(avg_reward), round(self.best_train), round(self.best_val)),
             mode='val'
         )

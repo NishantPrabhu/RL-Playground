@@ -52,6 +52,7 @@ class ViTDQN:
         self,
         input_shape: tuple,
         n_actions: int,
+        encoder_type: str = 'vit',
         double_dqn: bool = False,
         duel_dqn: bool = False,
         n_layers: int = 4,
@@ -91,25 +92,39 @@ class ViTDQN:
         self.replay_bs = replay_batch_size
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        self.encoder = networks.Encoder(
-            input_shape=input_shape,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            model_dim=model_dim,
-            patch_size=patch_size,
-            n_embeds=n_embeds,
-            add_action_embeds=add_action_embeds,
-            n_actions=n_actions
-        )
+        if encoder_type == 'vit':
+            self.encoder = networks.Encoder(
+                input_shape=input_shape,
+                n_layers=n_layers,
+                n_heads=n_heads,
+                model_dim=model_dim,
+                patch_size=patch_size,
+                n_embeds=n_embeds,
+                add_action_embeds=add_action_embeds,
+                n_actions=n_actions
+            ).to(self.device)
+        
+        elif encoder_type == 'conv_base':
+            self.encoder = networks.ConvBaseEncoder(
+                input_shape=input_shape, 
+                n_layers=n_layers, 
+                n_heads=n_heads, 
+                model_dim=model_dim, 
+                patch_size=patch_size, 
+                n_embeds=n_embeds,
+                add_action_embeds=add_action_embeds, 
+                n_actions=n_actions
+            )
+        
         if not duel_dqn:
-            self.online_q = networks.DuelQNetwork(model_dim, model_dim, n_actions)
+            self.online_q = networks.DuelQNetwork(model_dim, model_dim, n_actions).to(self.device)
             if double_dqn:
-                self.target_q = networks.DuelQNetwork(model_dim, model_dim, n_actions)
+                self.target_q = networks.DuelQNetwork(model_dim, model_dim, n_actions).to(self.device)
                 self.target_q.load_state_dict(self.online_q.state_dict())
         else:
-            self.online_q = networks.QNetwork(model_dim, model_dim, n_actions)
+            self.online_q = networks.QNetwork(model_dim, model_dim, n_actions).to(self.device)
             if double_dqn:
-                self.target_q = networks.QNetwork(model_dim, model_dim, n_actions)
+                self.target_q = networks.QNetwork(model_dim, model_dim, n_actions).to(self.device)
                 self.target_q.load_state_dict(self.online_q.state_dict())
                 
         self.trainable_params = list(self.encoder.parameters()) + list(self.online_q.parameters())
@@ -133,7 +148,7 @@ class ViTDQN:
             'qnet': self.online_q.state_dict(),
             'optim': self.optim.state_dict()
         }
-        torch.save(state, os.path.join(self.out_dir, 'checkpoint.pth.tar'))
+        torch.save(state, os.path.join(out_dir, 'checkpoint.pth.tar'))
     
     def load(self, ckpt_dir):
         fp = os.path.join(ckpt_dir, 'checkpoint.pth.tar')
@@ -162,9 +177,12 @@ class ViTDQN:
             group['lr'] = new_lr
             
     def preprocess_obs(self, frames):
-        assert np.asarray(frames).ndim == 4, f'Expected input with dim 4, got shape {np.asarray(frames).shape}'
-        obs = np.asarray(frames).transpose((0, 3, 1, 2))
-        obs = torch.from_numpy(obs).float().to(self.device) / 255.0
+        if np.asarray(frames).ndim == 3:
+            obs = np.expand_dims(np.asarray(frames), 0).transpose((0, 3, 1, 2))
+            obs = torch.from_numpy(obs).float().to(self.device) / 255.0
+        else:
+            obs = np.asarray(frames).transpose((0, 3, 1, 2))
+            obs = torch.from_numpy(obs).float().to(self.device) / 255.0
         return obs 
     
     def sample_action(self, frames):
@@ -173,6 +191,7 @@ class ViTDQN:
             action = random.randint(0, self.n_actions-1)
         else:
             with torch.no_grad():
+                obs, _ = self.encoder(obs)
                 action = self.online_q(obs).argmax(-1).item()
         
         self.step += 1
@@ -184,6 +203,7 @@ class ViTDQN:
     def select_action(self, frames):
         obs = self.preprocess_obs(frames)
         with torch.no_grad():
+            obs, _ = self.encoder(obs)
             action = self.online_q(obs).argmax(-1).item()
         return action
     
@@ -196,6 +216,7 @@ class ViTDQN:
         done = torch.from_numpy(done).long().to(self.device)
         
         with torch.no_grad():
+            next_obs, _ = self.encoder(next_obs)
             next_action = self.online_q(next_obs).argmax(-1)
             if self.double_dqn:
                 next_qval = self.target_q(next_obs).gather(1, next_action.view(-1, 1)).squeeze(-1)
@@ -203,7 +224,8 @@ class ViTDQN:
                 next_qval = self.online_q(next_obs).gather(1, next_action.view(-1, 1)).squeeze(-1)
             q_trg = reward + (1-done) * self.gamma * next_qval 
             
-        q_pred = self.online(obs).gather(1, action.view(-1, 1)).squeeze(-1)
+        obs, _ = self.encoder(obs)
+        q_pred = self.online_q(obs).gather(1, action.view(-1, 1)).squeeze(-1)
         loss = F.huber_loss(q_pred, q_trg)
         
         self.optim.zero_grad()
