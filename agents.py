@@ -114,7 +114,7 @@ class ViTDQN:
                 n_embeds=n_embeds,
                 add_action_embeds=add_action_embeds, 
                 n_actions=n_actions
-            )
+            ).to(self.device)
         
         if not duel_dqn:
             self.online_q = networks.DuelQNetwork(model_dim, model_dim, n_actions).to(self.device)
