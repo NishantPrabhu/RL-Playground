@@ -3,6 +3,7 @@ import os
 import math
 import wandb 
 import torch
+import faiss
 import argparse 
 import numpy as np
 import torch.nn.functional as F
@@ -10,8 +11,11 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
 from envs import env
+from tqdm import tqdm
 from agents import dqn 
+from faiss import Kmeans
 from datetime import datetime as dt 
+from sklearn.decomposition import PCA
 from utils import common, memory, cli_args
 from gym.wrappers.monitoring.video_recorder import VideoRecorder
 
@@ -217,6 +221,93 @@ class Trainer:
             rec.enabled = False
             self.env.close()
             self.logger.print("Attempt {:2d} | R: {}".format(i, total_reward), mode='val')
+            
+    def transition_probs(self, labels):
+        visit_probs = {}
+        n_txn = 0
+
+        for i in range(0, len(labels)-1):
+            s, s_ = labels[i], labels[i+1]
+            name = f'{s}_{s_}'
+            n_txn += 1
+            
+            if name not in visit_probs:
+                visit_probs[name] = 1
+            else:
+                visit_probs[name] += 1
+            
+        visit_probs = {k: v/n_txn for k, v in visit_probs.items()}
+        return visit_probs        
+        
+    @torch.no_grad()
+    def convert_to_mdp(self):
+        os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
+        self.agent.trainable(False)
+        features_buffer = []
+        actions_buffer = []
+
+        for _ in tqdm(range(100)):        
+            episode_done = False 
+            total_reward = 0
+            step = 0
+            obs = self.env.reset()
+            
+            while not episode_done:
+                action = self.agent.select_agent_action(obs)
+                next_obs, reward, done, info = self.env.step(action)
+                total_reward += reward
+                step += 1
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy()
+                features_buffer.append(state_fs)
+                actions_buffer.append(action)
+                
+                if done:
+                    episode_done = True
+                else:
+                    obs = next_obs
+                    
+        features = np.concatenate(features_buffer, 0).astype(np.float32)
+        kmeans = faiss.Kmeans(
+            features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
+        )
+        _ = kmeans.train(features)
+        centroids = kmeans.centroids
+        labels = kmeans.index.search(features, 1)[1].reshape(-1)
+        visit_probs = self.visitation_probs(labels)
+        
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        cen_pca = pca.transform(centroids)
+        
+        plt.figure(figsize=(16, 8))
+        plt.add_subplot(121)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, size=20, alpha=0.5)
+        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=40, edgecolors='k')
+        
+        for name, val in visit_probs.items():
+            s, s_ = [int(j) for j in name.split('_')]
+            cen1, cen2 = cen_pca[s], cen_pca[s_]
+            plt.line(cen1[0], cen1[1], cen2[0], cen2[1], color='k', alpha=val)
+            
+        plt.grid(alpha=0.3)
+        plt.title('Clustering by distance', fontsize=15)
+        
+        plt.add_subplot(122)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=actions_buffer, size=20, alpha=0.5)
+        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=40, edgecolors='k')
+        
+        for name, val in visit_probs.items():
+            s, s_ = [int(j) for j in name.split('_')]
+            cen1, cen2 = cen_pca[s], cen_pca[s_]
+            plt.line(cen1[0], cen1[1], cen2[0], cen2[1], color='k', alpha=val)
+        
+        plt.grid(alpha=0.3)
+        plt.title('Clustering by action', fontsize=15)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'100episodes.png'))
+        plt.close()
             
 
 class AttentionTrainer:
@@ -494,9 +585,9 @@ class AttentionTrainer:
             
         anim = animation.ArtistAnimation(fig, img_list, interval=10000, blit=True)
         anim.save(os.path.join(self.out_dir, 'videos', 'attn_viz.mp4'), fps=5)
+        
 
-            
-            
+           
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
@@ -511,3 +602,7 @@ if __name__ == "__main__":
     elif args.task == 'record':
         assert args.load is not None, 'Model checkpoint required for recording video'
         trainer.create_video()
+        
+    elif args.task == 'mdp':
+        assert args.load is not None, 'Model checkpoint required for MDP creation'
+        trainer.convert_to_mdp()
