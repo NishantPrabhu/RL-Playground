@@ -6,6 +6,7 @@ import dmc2gym
 import numpy as np
 import vizdoom as vzd
 import itertools as it
+import gym_minigrid.wrappers as mg_wrappers
 from .wrappers import make_env
 
     
@@ -21,6 +22,16 @@ def DMControlEnv(name, frame_res, frame_skip, stack_frames, reset_noops, episodi
                        height=frame_res[0], width=frame_res[1], frame_skip=frame_skip, 
                        channels_first=False)
     env = make_env(env, 'dmc', frame_res, frame_skip, stack_frames, reset_noops, episodic_life, clip_rewards)
+    return env
+
+
+def MiniGridEnv(name, fully_observable=True):
+    env = gym.make(name)
+    if fully_observable:
+        env = mg_wrappers.RGBImgObsWrapper(env)
+    else:
+        env = mg_wrappers.RGBImgPartialObsWrapper(env)
+    env = mg_wrappers.ImgObsWrapper(env)
     return env
 
 
