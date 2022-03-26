@@ -5,6 +5,7 @@ import time
 import math
 import wandb 
 import torch
+import faiss
 import random
 import argparse
 import numpy as np
@@ -14,8 +15,10 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
+from tqdm import tqdm
 from envs import env
 from agents import dqn 
+from sklearn.decomposition import PCA
 from datetime import datetime as dt
 from utils import common, memory, cli_args
 from gym.wrappers.monitoring.video_recorder import VideoRecorder
@@ -41,6 +44,7 @@ class Trainer:
             screen_res=args.screen_res
         )
         self.action_size = len(self.actions)
+        self.n_actions = len(self.actions[0])
         
         self.agent = dqn.DQN(
             input_ch=args.frame_stack,
@@ -230,6 +234,208 @@ class Trainer:
             self.logger.print('E: {:7d} | R: {:4d}'.format(i+1, round(total_reward)))
             
         self.env.close()
+        
+    def transition_probs(self, labels):
+        visit_probs = {}
+        n_txn = 0
+
+        for i in range(0, len(labels)-1):
+            s, s_ = labels[i], labels[i+1]
+            name = f'{s}_{s_}'
+            n_txn += 1
+            
+            if name not in visit_probs:
+                visit_probs[name] = 1
+            else:
+                visit_probs[name] += 1
+            
+        visit_probs = {k: v/n_txn for k, v in visit_probs.items()}
+        return visit_probs        
+        
+    @torch.no_grad()
+    def convert_to_mdp(self):
+        os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
+        self.agent.trainable(False)
+        features_buffer = []
+        actions_buffer = []
+
+        for _ in tqdm(range(100)):        
+            episode_done = False 
+            total_reward = 0
+            step = 0
+            
+            self.env.new_episode()
+            while not episode_done:
+                obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                action = self.agent.select_action(obs)
+                reward = self.env.make_action(self.actions[action], self.args.frame_skip)
+                done = int(self.env.is_episode_finished())
+                step += 1
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy()
+                features_buffer.append(state_fs)
+                actions_buffer.append(action)
+                
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True
+                    
+        features = np.concatenate(features_buffer, 0).astype(np.float32)
+        kmeans = faiss.Kmeans(
+            features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
+        )
+        _ = kmeans.train(features)
+        centroids = kmeans.centroids
+        labels = kmeans.index.search(features, 1)[1].reshape(-1)
+        visit_probs = self.transition_probs(labels)
+        
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        cen_pca = pca.transform(centroids)
+        
+        # PCA sanity check
+        pca2 = PCA(n_components=10)
+        pca2.fit(features)
+        expvars = pca2.explained_variance_ratio_ * 100
+        cumsum = [sum(expvars[:i]) for i in range(1, len(expvars))]
+        
+        plt.figure(figsize=(8, 6))
+        plt.plot(cumsum, linewidth=2, color='b')
+        plt.grid(alpha=0.4)
+        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'pca_variance_cumsum.png'))
+        
+        plt.figure(figsize=(16, 8))
+        plt.subplot(121)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.4, cmap='Set1')
+        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=120, edgecolors='k', cmap='Set1')
+        
+        for name, val in visit_probs.items():
+            s, s_ = [int(j) for j in name.split('_')]
+            cen1, cen2 = cen_pca[s], cen_pca[s_]
+            plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k', alpha=0.1)
+            
+        plt.grid(alpha=0.3)
+        plt.title('Clustering by distance', fontsize=15)
+        
+        plt.subplot(122)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=actions_buffer, s=20, alpha=0.4, cmap='Set1')
+        # plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=120, edgecolors='k', cmap='Set1')
+        
+        # for name, val in visit_probs.items():
+        #     s, s_ = [int(j) for j in name.split('_')]
+        #     cen1, cen2 = cen_pca[s], cen_pca[s_]
+        #     plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k', alpha=0.1)
+        
+        plt.grid(alpha=0.3)
+        plt.title('Clustering by action', fontsize=15)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'100episodes.png'))
+        plt.close()
+        
+    @torch.no_grad()
+    def play_on_mdp(self):
+        os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
+        self.agent.trainable(False)
+        features_buffer = []
+        actions_buffer = []
+
+        for _ in tqdm(range(100)):        
+            episode_done = False 
+            total_reward = 0
+            step = 0
+            
+            self.env.new_episode()
+            while not episode_done:
+                obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                action = self.agent.select_action(obs)
+                reward = self.env.set_action(self.actions[action])
+                for _ in range(self.args.frame_skip):
+                    self.env.advance_action()
+                done = int(self.env.is_episode_finished())
+                step += 1
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy()
+                features_buffer.append(state_fs)
+                actions_buffer.append(action)
+                
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True
+                    
+        features = np.concatenate(features_buffer, 0).astype(np.float32)
+        kmeans = faiss.Kmeans(
+            features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
+        )
+        _ = kmeans.train(features)
+        centroids = kmeans.centroids
+        labels = kmeans.index.search(features, 1)[1].reshape(-1)
+        
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        cen_pca = pca.transform(centroids)
+        
+        labels_, obses = [], []
+        rewards, q_preds = [], []
+        
+        for _ in range(5):
+            episode_done = False 
+            
+            self.env.new_episode()
+            while not episode_done:
+                frames = [self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)]
+                obs = self._warp(frames)
+                action = self.agent.select_action(obs)
+                reward = self.env.make_action(self.actions[action], self.args.frame_skip)
+                done = int(self.env.is_episode_finished())
+                rewards.append(reward)
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy().astype(np.float32)
+                q_pred = self.agent.online_q(self.agent.preprocess_obs(obs))[0].detach().cpu().numpy().reshape(-1,)[action]
+                q_preds.append(q_pred)
+                label = kmeans.index.search(state_fs, 1)[1].item()
+                labels_.append(label)
+                obses.append(frames[-1])
+                
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True
+                    
+        discounted_sum = lambda seq: sum([seq[i] * self.args.gamma ** i for i in range(len(seq))])
+        returns = [discounted_sum(rewards[j:]) for j in range(len(rewards))]
+        
+        for i in range(len(labels_)):
+            plt.figure(figsize=(24, 8))
+            plt.subplot(131)
+            plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.4, cmap='Set1')
+            plt.scatter(cen_pca[:, 0], cen_pca[:, 1], 
+                        c=np.arange(centroids.shape[0]), 
+                        s=[500 if j == labels_[i] else 120 for j in range(centroids.shape[0])], 
+                        edgecolors='k', 
+                        cmap='Set1')
+            plt.grid(alpha=0.3)
+            
+            plt.subplot(132)
+            plt.imshow(obses[i], cmap='gray')
+            plt.axis('off')
+            
+            plt.subplot(133)
+            plt.plot(returns[:i], color='b', linewidth=2, label='Actual discounted return')
+            plt.plot(q_preds[:i], color='r', linewidth=2, label='Predicted return')
+            plt.grid(alpha=0.4)
+            plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'episode_play_{i}.png'))
+            plt.close()       
         
         
 class ClusteringTrainer:
@@ -992,3 +1198,7 @@ if __name__ == "__main__":
     elif args.task == 'attn_viz':
         assert args.load is not None, 'Model checkpoint required for generating attention visualization'
         trainer.show_attention_on_frames(args.viz_layer)
+        
+    elif args.task == 'mdp':
+        assert args.load is not None, 'Model checkpoint required for generating MDP'
+        trainer.play_on_mdp()

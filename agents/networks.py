@@ -1,6 +1,8 @@
 
 import math
 import torch 
+import random 
+import numpy as np
 import torch.nn as nn 
 import torch.nn.functional as F 
     
@@ -172,8 +174,13 @@ class QNetwork(nn.Module):
                 nn.init.constant_(m.weight, 0)
                 nn.init.constant_(m.bias, 1)
         
-    def forward(self, obs):
+    def forward(self, obs, replay=False):
         pooled_fs, fs = self.encoder(obs)
+        
+        if replay and random.uniform(0, 1) < 0.5:
+            noise = torch.from_numpy(np.random.normal(0, 0.01, size=pooled_fs.shape)).float().to(pooled_fs.device)
+            pooled_fs += noise
+            
         q_vals = self.q_action(pooled_fs)
         return q_vals, pooled_fs, fs
     
@@ -204,8 +211,13 @@ class DuelQNetwork(nn.Module):
                 nn.init.constant_(m.weight, 0)
                 nn.init.constant_(m.bias, 1)
         
-    def forward(self, obs):
+    def forward(self, obs, replay=False):
         pooled_fs, fs = self.encoder(obs)
+        
+        if replay and random.uniform(0, 1) < 0.5:
+            noise = torch.from_numpy(np.random.normal(0, 0.01, size=pooled_fs.shape)).float().to(pooled_fs.device)
+            pooled_fs += noise
+        
         fs_action, fs_value = torch.split(pooled_fs, self.encoder.out_dim // 2, 1)
         action_q = self.q_action(fs_action)
         value_q = self.q_value(fs_value)

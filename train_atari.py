@@ -63,6 +63,7 @@ class Trainer:
             mem_size=args.replay_mem_size, 
             obs_shape=(args.frame_height, args.frame_width, args.frame_stack)
         )
+        self.n_actions = self.env.action_space.n
         
         if args.load is not None:
             self.agent.load(args.load)
@@ -275,39 +276,141 @@ class Trainer:
         _ = kmeans.train(features)
         centroids = kmeans.centroids
         labels = kmeans.index.search(features, 1)[1].reshape(-1)
-        visit_probs = self.visitation_probs(labels)
+        visit_probs = self.transition_probs(labels)
         
         pca = PCA(n_components=2)
         fs_pca = pca.fit_transform(features)
         cen_pca = pca.transform(centroids)
         
+        # PCA sanity check
+        pca2 = PCA(n_components=100)
+        pca2.fit(features)
+        expvars = pca2.explained_variance_ratio_ * 100
+        cumsum = [sum(expvars[:i]) for i in range(1, len(expvars))]
+        
+        plt.figure(figsize=(8, 6))
+        plt.plot(cumsum, linewidth=2, color='b')
+        plt.grid(alpha=0.4)
+        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'pca_variance_cumsum.png'))
+        
         plt.figure(figsize=(16, 8))
-        plt.add_subplot(121)
-        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, size=20, alpha=0.5)
-        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=40, edgecolors='k')
+        plt.subplot(121)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.1)
+        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=80, edgecolors='k')
         
         for name, val in visit_probs.items():
             s, s_ = [int(j) for j in name.split('_')]
             cen1, cen2 = cen_pca[s], cen_pca[s_]
-            plt.line(cen1[0], cen1[1], cen2[0], cen2[1], color='k', alpha=val)
+            plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k')
             
         plt.grid(alpha=0.3)
         plt.title('Clustering by distance', fontsize=15)
         
-        plt.add_subplot(122)
-        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=actions_buffer, size=20, alpha=0.5)
-        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=40, edgecolors='k')
+        plt.subplot(122)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=actions_buffer, s=20, alpha=0.1)
+        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=80, edgecolors='k')
         
         for name, val in visit_probs.items():
             s, s_ = [int(j) for j in name.split('_')]
             cen1, cen2 = cen_pca[s], cen_pca[s_]
-            plt.line(cen1[0], cen1[1], cen2[0], cen2[1], color='k', alpha=val)
+            plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k')
         
         plt.grid(alpha=0.3)
         plt.title('Clustering by action', fontsize=15)
         plt.tight_layout()
         plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'100episodes.png'))
         plt.close()
+        
+    @torch.no_grad()
+    def play_on_mdp(self):
+        os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
+        self.agent.trainable(False)
+        features_buffer = []
+        actions_buffer = []
+
+        for _ in tqdm(range(10)):        
+            episode_done = False 
+            obs = self.env.reset()
+            
+            while not episode_done:
+                action = self.agent.select_agent_action(obs)
+                next_obs, reward, done, info = self.env.step(action)
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy()
+                features_buffer.append(state_fs)
+                actions_buffer.append(action)
+                
+                if done:
+                    episode_done = True
+                else:
+                    obs = next_obs
+                    
+        features = np.concatenate(features_buffer, 0).astype(np.float32)
+        kmeans = faiss.Kmeans(
+            features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
+        )
+        _ = kmeans.train(features)
+        centroids = kmeans.centroids
+        labels = kmeans.index.search(features, 1)[1].reshape(-1)
+        
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        cen_pca = pca.transform(centroids)
+        
+        labels_, obses = [], []
+        rewards, q_preds = [], []
+        
+        for _ in range(1):        
+            episode_done = False 
+            obs = self.env.reset()
+            
+            while not episode_done:
+                action = self.agent.select_agent_action(obs)
+                next_obs, reward, done, info = self.env.step(action)
+                rewards.append(reward)
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy()
+                q_pred = self.agent.online_q(self.agent.preprocess_obs(obs))[0].detach().cpu().numpy().reshape(-1)[action]
+                q_preds.append(q_pred)
+                obses.append(np.asarray(obs)[:, :, -1])
+                label = kmeans.index.search(state_fs, 1)[1].item()
+                labels_.append(label)
+                
+                if done:
+                    episode_done = True
+                else:
+                    obs = next_obs
+                    
+        discounted_sum = lambda seq: sum([seq[i] * self.args.gamma ** i for i in range(len(seq))])
+        returns = [discounted_sum(rewards[j:]) for j in range(len(rewards))]
+        
+        for i in range(len(labels_)):
+            if i % 5 == 0:
+                plt.figure(figsize=(24, 8))
+                plt.subplot(131)
+                plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.4, cmap='Set1')
+                plt.scatter(cen_pca[:, 0], cen_pca[:, 1], 
+                            c=np.arange(centroids.shape[0]), 
+                            s=[500 if j == labels_[i] else 120 for j in range(centroids.shape[0])], 
+                            edgecolors='k', 
+                            cmap='Set1')
+                plt.grid(alpha=0.3)
+                
+                plt.subplot(132)
+                plt.imshow(obses[i], cmap='gray')
+                plt.axis('off')
+                
+                plt.subplot(133)
+                plt.plot(returns[:i], color='b', linewidth=2, label='Actual discounted return')
+                plt.plot(q_preds[:i], color='r', linewidth=2, label='Predicted return')
+                plt.grid(alpha=0.4)
+                plt.legend()
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'episode_play_{i}.png'))
+                plt.close() 
             
 
 class AttentionTrainer:
@@ -586,7 +689,96 @@ class AttentionTrainer:
         anim = animation.ArtistAnimation(fig, img_list, interval=10000, blit=True)
         anim.save(os.path.join(self.out_dir, 'videos', 'attn_viz.mp4'), fps=5)
         
+    def transition_probs(self, labels):
+        visit_probs = {}
+        n_txn = 0
 
+        for i in range(0, len(labels)-1):
+            s, s_ = labels[i], labels[i+1]
+            name = f'{s}_{s_}'
+            n_txn += 1
+            
+            if name not in visit_probs:
+                visit_probs[name] = 1
+            else:
+                visit_probs[name] += 1
+            
+        visit_probs = {k: v/n_txn for k, v in visit_probs.items()}
+        return visit_probs
+        
+    @torch.no_grad()
+    def convert_to_mdp(self):
+        os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
+        self.agent.trainable(False)
+        features_buffer = []
+        actions_buffer = []
+
+        for _ in tqdm(range(10)):        
+            episode_done = False 
+            total_reward = 0
+            step = 0
+            obs = self.env.reset()
+            
+            while not episode_done:
+                action = self.agent.select_agent_action(obs)
+                next_obs, reward, done, info = self.env.step(action)
+                total_reward += reward
+                step += 1
+                
+                qvals, state_fs, _, _ = self.agent.online_q(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy()
+                features_buffer.append(state_fs)
+                actions_buffer.append(action)
+                
+                if done:
+                    episode_done = True
+                else:
+                    obs = next_obs
+                    
+        features = np.concatenate(features_buffer, 0).astype(np.float32)
+        kmeans = faiss.Kmeans(
+            features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
+        )
+        _ = kmeans.train(features)
+        centroids = kmeans.centroids
+        labels = kmeans.index.search(features, 1)[1].reshape(-1)
+        visit_probs = self.transition_probs(labels)
+        
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        cen_pca = pca.transform(centroids)
+        
+        # PCA sanity check
+        pca2 = PCA(n_components=100)
+        pca2.fit(features)
+        expvars = pca2.explained_variance_ratio_ * 100
+        cumsum = [sum(expvars[:i]) for i in range(1, len(expvars))]
+        
+        plt.figure(figsize=(8, 6))
+        plt.plot(cumsum, linewidth=2, color='b')
+        plt.grid(alpha=0.4)
+        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'pca_variance_cumsum.png'))
+        
+        plt.figure(figsize=(16, 8))
+        plt.subplot(121)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.1)
+        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=80, edgecolors='k')
+        
+        for name, val in visit_probs.items():
+            s, s_ = [int(j) for j in name.split('_')]
+            cen1, cen2 = cen_pca[s], cen_pca[s_]
+            plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k')
+            
+        plt.grid(alpha=0.3)
+        plt.title('Clustering by distance', fontsize=15)
+        
+        plt.subplot(122)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=actions_buffer, s=20, alpha=0.1)
+        plt.grid(alpha=0.3)
+        plt.title('Clustering by action', fontsize=15)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'100episodes.png'))
+        plt.close()
            
 if __name__ == "__main__":
     

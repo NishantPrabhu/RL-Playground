@@ -5,7 +5,7 @@
 
 def add_atari_args(parser):
     parser.add_argument('--expt_name', type=str, required=True, help='experiment name')
-    parser.add_argument('--task', type=str, required=True, choices=['train', 'record'], help='whether to train or record')
+    parser.add_argument('--task', type=str, required=True, help='whether to train or record')
     parser.add_argument('--load', type=str, default=None, help='directory with model checkpoint to load')
     parser.add_argument('--resume', type=str, default=None, help='directory with model checkpoint to load')
     parser.add_argument('--wandb', action='store_true', help='log metrics on wandb')

@@ -126,7 +126,7 @@ class DQN:
             next_values = self.target_q(next_obs)[0].gather(1, next_action.view(-1, 1)).squeeze(-1)
             q_trg = reward + (1-done) * self.gamma * next_values 
             
-        q_pred = self.online_q(obs)[0].gather(1, action.view(-1, 1)).squeeze(-1)
+        q_pred = self.online_q(obs, replay=True)[0].gather(1, action.view(-1, 1)).squeeze(-1)
         loss = F.huber_loss(q_pred, q_trg)
         
         self.optim.zero_grad()
