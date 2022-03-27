@@ -94,7 +94,7 @@ def add_minigrid_args(parser):
     parser.add_argument('--replay_mem_size', type=int, default=100000, help='replay memory size')
     parser.add_argument('--batch_size', type=int, default=32, help='replay memory sampling batch size')
     parser.add_argument('--cls_batch_size', type=int, default=256, help='replay memory sampling batch size for clustering')
-    parser.add_argument('--mem_init_steps', type=int, default=50000, help='num random actions to initialize memory')
+    parser.add_argument('--mem_init_steps', type=int, default=5000, help='num random actions to initialize memory')
     parser.add_argument('--mem_replay_interval', type=int, default=4, help='memory replay happens every this many steps')
     parser.add_argument('--cls_learning_interval', type=int, default=4, help='clustering step happens every this many steps')
     parser.add_argument('--train_episodes', type=int, default=100000, help='num training episodes')

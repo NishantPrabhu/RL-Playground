@@ -32,6 +32,8 @@ def MiniGridEnv(name, fully_observable=True):
     else:
         env = mg_wrappers.RGBImgPartialObsWrapper(env)
     env = mg_wrappers.ImgObsWrapper(env)
+    env = mg_wrappers.ReseedWrapper(env)
+    # env = mg_wrappers.StateBonus(env)
     return env
 
 

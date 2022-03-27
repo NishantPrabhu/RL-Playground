@@ -86,14 +86,16 @@ class PixelEncoder(nn.Module):
         self.conv2 = nn.Conv2d(hidden_ch, hidden_ch * 2, kernel_size=4, stride=2, bias=False)
         self.conv3 = nn.Conv2d(hidden_ch * 2, hidden_ch * 2, kernel_size=3, stride=1, bias=False)
         self.conv4 = nn.Conv2d(hidden_ch * 2, out_ch, kernel_size=7, stride=1, bias=False)
+        self.avgpool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
         self.relu = nn.ReLU()
         self.out_dim = out_ch 
         
     def forward(self, x):
         x = self.relu(self.conv1(x))
         x = self.relu(self.conv2(x))
-        fs = self.relu(self.conv3(x))
-        pooled_fs = self.relu(self.conv4(fs))
+        x = self.relu(self.conv3(x))
+        fs = self.conv4(x)
+        pooled_fs = self.avgpool(fs)
         pooled_fs = torch.flatten(pooled_fs, 1)
         return pooled_fs, fs
     

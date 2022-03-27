@@ -235,6 +235,66 @@ class Trainer:
             
         self.env.close()
         
+    @torch.no_grad()
+    def automap_viz(self):
+        self.env.close()
+        self.env.set_mode(vzd.Mode.ASYNC_PLAYER)
+        self.env.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
+        self.env.set_screen_format(vzd.ScreenFormat.RGB24)
+        self.env.set_automap_buffer_enabled(True)
+        self.env.set_automap_mode(vzd.AutomapMode.OBJECTS_WITH_SIZE)
+        self.env.add_available_game_variable(vzd.GameVariable.POSITION_X)
+        self.env.add_available_game_variable(vzd.GameVariable.POSITION_Y)
+        self.env.add_available_game_variable(vzd.GameVariable.POSITION_Z)
+        self.env.set_window_visible(False)
+        self.env.add_game_args("+am_followplayer 1")
+        self.env.add_game_args("+viz_am_scale 10")
+        self.env.add_game_args("+viz_am_center 1")
+        self.env.add_game_args("+am_backcolor 000000")
+        self.env.add_game_args("+am_yourcolor ffff00")
+        self.env.add_game_args("+am_thingcolor_monster ff0000")
+        self.env.add_game_args("+am_thingcolor_item 00ff00")
+        self.env.init()
+        
+        self.agent.trainable(False)
+        meter = common.AverageMeter()
+        fig, axarr = plt.subplots(1, 2, figsize=(10, 4))
+        total_rewards = []
+        images = []
+            
+        for j in range(self.args.eval_episodes):
+            episode_done = False
+            total_reward = 0
+            
+            self.env.new_episode()
+            while not episode_done:
+                obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                action = self.agent.select_agent_action(obs)
+                reward = self.env.set_action(self.actions[action])
+                
+                for _ in range(self.args.frame_skip):
+                    self.env.advance_action()
+                    if not int(self.env.is_episode_finished()):
+                        im1 = axarr[0].imshow(self.env.get_state().screen_buffer, cmap='gray')
+                        axarr[0].axis('off')
+                        im2 = axarr[1].imshow(self.env.get_state().automap_buffer, cmap='gray')
+                        axarr[1].axis('off')
+                        images.append([im1, im2])
+                        
+                done = int(self.env.is_episode_finished())
+                    
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True
+
+            total_rewards.append(self.env.get_total_reward())
+            print(f"Episode {j+1}: Total reward = {self.env.get_total_reward()}")
+            
+        anim = animation.ArtistAnimation(fig, images, interval=10000, blit=True)
+        anim.save(os.path.join(self.out_dir, 'videos', 'automap_viz.mp4'.format(np.mean(total_rewards))), fps=24)            
+        
     def transition_probs(self, labels):
         visit_probs = {}
         n_txn = 0
@@ -1202,3 +1262,7 @@ if __name__ == "__main__":
     elif args.task == 'mdp':
         assert args.load is not None, 'Model checkpoint required for generating MDP'
         trainer.play_on_mdp()
+        
+    elif args.task == 'automap':
+        assert args.load is not None, 'Model checkpoint required for automap viz'
+        trainer.automap_viz()

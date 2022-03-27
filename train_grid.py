@@ -79,20 +79,22 @@ class Trainer:
             self.logger.print('Found GPU device: {}'.format(torch.cuda.get_device_name(0)), mode='info')
         
         self.batch_size = self.args.batch_size
-        self.best_train, self.best_val = 0, 0
+        self.best_train, self.best_val = -100, -100
         
     def init_memory(self):
         obs = self.env.reset()
+        obs = self._warp(obs)
         for step in range(self.args.mem_init_steps):
             action = self.env.action_space.sample()
             next_obs, reward, done, _ = self.env.step(action)
+            next_obs = self._warp(next_obs)
             reward_scaled = np.sign(reward)
             
             if reward > self.best_train:
                 self.best_train = reward
             
             self.memory.store(obs, action, reward_scaled, next_obs, done)
-            obs = next_obs if not done else self.env.reset()
+            obs = next_obs if not done else self._warp(self.env.reset())
             common.pbar((step+1)/self.args.mem_init_steps, desc='Progress', status='')
             
         total_loss = 0
@@ -107,7 +109,7 @@ class Trainer:
         self.logger.record('[loss] {:.4f} [train_best] {}'.format(avg_loss, self.best_train), mode='train')
         
     def _warp(self, frame):
-        return cv2.resize(frame, (args.frame_width, args.frame_height), cv2.INTER_BILINEAR)
+        return cv2.resize(frame, (args.frame_width, args.frame_height), cv2.INTER_AREA)
         
     def train_episode(self, episode):
         self.agent.trainable(True)
@@ -121,9 +123,9 @@ class Trainer:
         while not episode_done:
             action = self.agent.select_action(obs)
             next_obs, reward, done, info = self.env.step(action)
+            reward_scaled = reward * 100 - 1 * (1 - int(done))
             next_obs = self._warp(next_obs)
-            reward_scaled = np.sign(reward)
-            total_reward += reward
+            total_reward += reward_scaled
             step += 1
             
             self.memory.store(obs, action, reward_scaled, next_obs, done)
@@ -141,8 +143,8 @@ class Trainer:
             self.best_train = round(total_reward)
             
         if episode % self.args.log_interval == 0:
-            self.logger.record("Episode {:7d} [reward] {:5d} {} [train_best] {:3d} [val_best] {:3d}".format(
-                episode, round(total_reward), meter.msg(), round(self.best_train), round(self.best_val)),
+            self.logger.record("Episode {:7d} [reward] {:5d} [steps] {} {} [train_best] {:3d} [val_best] {:3d}".format(
+                episode, round(total_reward), step, meter.msg(), round(self.best_train), round(self.best_val)),
                 mode='train'
             )
         if self.log_wandb:
@@ -152,6 +154,7 @@ class Trainer:
     def evaluate(self, episode):
         self.agent.trainable(False)
         meter = common.AverageMeter()
+        step = 0
             
         for _ in range(self.args.eval_episodes):
             episode_done = False 
@@ -162,8 +165,10 @@ class Trainer:
             while not episode_done:
                 action = self.agent.select_agent_action(obs)
                 next_obs, reward, done, info = self.env.step(action)
+                reward_scaled = reward * 100 - 1 * (1-int(done))
                 next_obs = self._warp(next_obs)
-                total_reward += reward
+                total_reward += reward_scaled
+                step += 1
                 
                 if done:
                     episode_done = True
@@ -176,8 +181,8 @@ class Trainer:
             self.best_val = round(avg_reward)
             self.agent.save(self.out_dir)
               
-        self.logger.record("Episode {:7d} [reward] {:5d} [train_best] {:3d} [val_best] {:3d}".format(
-            episode, round(avg_reward), round(self.best_train), round(self.best_val)),
+        self.logger.record("Episode {:7d} [reward] {:5d} [steps] {} [train_best] {:3d} [val_best] {:3d}".format(
+            episode, round(avg_reward), step, round(self.best_train), round(self.best_val)),
             mode='val'
         )
         if self.log_wandb:
@@ -214,8 +219,9 @@ class Trainer:
             while not episode_done:
                 action = self.agent.select_agent_action(obs)
                 next_obs, reward, done, info = self.env.step(action)
+                reward_scaled = reward * 100 - 1 * (1-int(done))
                 next_obs = self._warp(next_obs)
-                total_reward += reward
+                total_reward += reward_scaled
                 rec.capture_frame()
 
                 if done:
@@ -262,8 +268,9 @@ class Trainer:
             while not episode_done:
                 action = self.agent.select_agent_action(obs)
                 next_obs, reward, done, info = self.env.step(action)
+                reward_scaled = reward * 100 - 1 * (1-int(done))
                 next_obs = self._warp(next_obs)
-                total_reward += reward
+                total_reward += reward_scaled
                 step += 1
                 
                 state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
@@ -378,8 +385,9 @@ class Trainer:
             while not episode_done:
                 action = self.agent.select_agent_action(obs)
                 next_obs, reward, done, info = self.env.step(action)
+                reward_scaled = reward * 100 - 1 * (1 - int(done))
                 next_obs = self._warp(next_obs)
-                rewards.append(reward)
+                rewards.append(reward_sclaed)
                 
                 state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
                 state_fs = state_fs.detach().cpu().numpy()
