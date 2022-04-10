@@ -5,8 +5,10 @@ import math
 import wandb 
 import torch
 import faiss
+import shutil
 import argparse 
 import numpy as np
+import pandas as pd
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -15,8 +17,10 @@ from envs import env
 from tqdm import tqdm
 from agents import dqn 
 from faiss import Kmeans
+from PIL import Image
 from datetime import datetime as dt 
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 from utils import common, memory, cli_args
 from gym.wrappers.monitoring.video_recorder import VideoRecorder
 
@@ -88,12 +92,11 @@ class Trainer:
             action = self.env.action_space.sample()
             next_obs, reward, done, _ = self.env.step(action)
             next_obs = self._warp(next_obs)
-            reward_scaled = np.sign(reward)
             
             if reward > self.best_train:
                 self.best_train = reward
             
-            self.memory.store(obs, action, reward_scaled, next_obs, done)
+            self.memory.store(obs, action, reward, next_obs, done)
             obs = next_obs if not done else self._warp(self.env.reset())
             common.pbar((step+1)/self.args.mem_init_steps, desc='Progress', status='')
             
@@ -123,12 +126,13 @@ class Trainer:
         while not episode_done:
             action = self.agent.select_action(obs)
             next_obs, reward, done, info = self.env.step(action)
-            reward_scaled = reward * 100 - 1 * (1 - int(done))
+            # if "Lava" not in self.args.expt_name and "DistShift" not in self.args.expt_name:
+            reward = reward * 10 - 0.001 * (1 - int(done))
             next_obs = self._warp(next_obs)
-            total_reward += reward_scaled
+            total_reward += reward
             step += 1
             
-            self.memory.store(obs, action, reward_scaled, next_obs, done)
+            self.memory.store(obs, action, reward, next_obs, done)
             if done:
                 episode_done = True
             else:
@@ -142,9 +146,12 @@ class Trainer:
         if total_reward > self.best_train:
             self.best_train = round(total_reward)
             
+        if episode % 50 == 0:
+            self.agent.save(self.out_dir)
+            
         if episode % self.args.log_interval == 0:
-            self.logger.record("Episode {:7d} [reward] {:5d} [steps] {} {} [train_best] {:3d} [val_best] {:3d}".format(
-                episode, round(total_reward), step, meter.msg(), round(self.best_train), round(self.best_val)),
+            self.logger.record("Episode {:7d} [reward] {:.4f} [steps] {} {} [train_best] {:.4f} [val_best] {:.4f}".format(
+                episode, total_reward, step, meter.msg(), self.best_train, self.best_val),
                 mode='train'
             )
         if self.log_wandb:
@@ -165,9 +172,10 @@ class Trainer:
             while not episode_done:
                 action = self.agent.select_agent_action(obs)
                 next_obs, reward, done, info = self.env.step(action)
-                reward_scaled = reward * 100 - 1 * (1-int(done))
+                # if "Lava" not in self.args.expt_name and "DistShift" not in self.args.expt_name:
+                reward = reward * 10 - 0.001 * (1-int(done))
                 next_obs = self._warp(next_obs)
-                total_reward += reward_scaled
+                total_reward += reward
                 step += 1
                 
                 if done:
@@ -179,10 +187,10 @@ class Trainer:
         avg_reward = meter.get()['reward']
         if avg_reward > self.best_val:
             self.best_val = round(avg_reward)
-            self.agent.save(self.out_dir)
+            # self.agent.save(self.out_dir)
               
-        self.logger.record("Episode {:7d} [reward] {:5d} [steps] {} [train_best] {:3d} [val_best] {:3d}".format(
-            episode, round(avg_reward), step, round(self.best_train), round(self.best_val)),
+        self.logger.record("Episode {:7d} [reward] {:.4f} [steps] {} [train_best] {:.4f} [val_best] {:.4f}".format(
+            episode, avg_reward, step, self.best_train, self.best_val),
             mode='val'
         )
         if self.log_wandb:
@@ -219,9 +227,10 @@ class Trainer:
             while not episode_done:
                 action = self.agent.select_agent_action(obs)
                 next_obs, reward, done, info = self.env.step(action)
-                reward_scaled = reward * 100 - 1 * (1-int(done))
+                # if "Lava" not in self.args.expt_name and "DistShift" not in self.args.expt_name:
+                reward = reward * 10 - 0.001 * (1-int(done))
                 next_obs = self._warp(next_obs)
-                total_reward += reward_scaled
+                total_reward += reward
                 rec.capture_frame()
 
                 if done:
@@ -253,10 +262,19 @@ class Trainer:
         
     @torch.no_grad()
     def convert_to_mdp(self):
+        if not os.path.exists('assets'):
+            os.makedirs('assets')
+        
+        if len(os.listdir('assets')) > 0:
+            shutil.rmtree('assets')
+            os.makedirs('assets')
+            
         os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
         self.agent.trainable(False)
         features_buffer = []
         actions_buffer = []
+        filenames = []
+        count = 0
 
         for _ in tqdm(range(100)):        
             episode_done = False 
@@ -268,7 +286,7 @@ class Trainer:
             while not episode_done:
                 action = self.agent.select_agent_action(obs)
                 next_obs, reward, done, info = self.env.step(action)
-                reward_scaled = reward * 100 - 1 * (1-int(done))
+                reward_scaled = reward - 0.01 * (1-int(done))
                 next_obs = self._warp(next_obs)
                 total_reward += reward_scaled
                 step += 1
@@ -278,12 +296,30 @@ class Trainer:
                 features_buffer.append(state_fs)
                 actions_buffer.append(action)
                 
+                frame_img = Image.fromarray(np.asarray(obs)[:, :, -1])
+                frame_img.save(f'assets/{count}.png', format='PNG')
+                filenames.append(f'{count}.png')
+                count += 1
+                
                 if done:
                     episode_done = True
                 else:
                     obs = next_obs
                     
         features = np.concatenate(features_buffer, 0).astype(np.float32)
+        tsne = TSNE(n_components=2, perplexity=100)
+        fs_tsne = tsne.fit_transform(features)
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        
+        df = pd.DataFrame({
+            **{f'pca{j}': fs_pca[:, j].reshape(-1) for j in range(fs_pca.shape[1])}, 
+            **{f'tsne{j}': fs_tsne[:, j].reshape(-1) for j in range(fs_tsne.shape[1])},
+            'impath': filenames, 
+            'action': actions_buffer
+        })
+        df.to_csv("minigrid_viz_data.csv")
+        
         kmeans = faiss.Kmeans(
             features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
         )

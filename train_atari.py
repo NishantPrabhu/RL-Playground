@@ -5,7 +5,9 @@ import wandb
 import torch
 import faiss
 import argparse 
+import shutil
 import numpy as np
+import pandas as pd
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -14,8 +16,10 @@ from envs import env
 from tqdm import tqdm
 from agents import dqn 
 from faiss import Kmeans
+from PIL import Image
 from datetime import datetime as dt 
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 from utils import common, memory, cli_args
 from gym.wrappers.monitoring.video_recorder import VideoRecorder
 
@@ -241,13 +245,22 @@ class Trainer:
         return visit_probs        
         
     @torch.no_grad()
-    def convert_to_mdp(self):
+    def convert_to_mdp(self, tsne_perplexity=30):
+        if not os.path.exists('assets'):
+            os.makedirs('assets')
+        
+        if len(os.listdir('assets')) > 0:
+            shutil.rmtree('assets')
+            os.makedirs('assets')
+            
         os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
         self.agent.trainable(False)
         features_buffer = []
         actions_buffer = []
+        filenames = []
+        count = 0
 
-        for _ in tqdm(range(100)):        
+        for _ in tqdm(range(5)):        
             episode_done = False 
             total_reward = 0
             step = 0
@@ -264,12 +277,32 @@ class Trainer:
                 features_buffer.append(state_fs)
                 actions_buffer.append(action)
                 
+                frame_img = Image.fromarray(np.asarray(obs)[:, :, -1])
+                frame_img.save(f'assets/{count}.png', format='PNG')
+                filenames.append(f'{count}.png')
+                count += 1
+                
                 if done:
                     episode_done = True
                 else:
                     obs = next_obs
                     
+            print("Total reward: {}".format(total_reward))
+                    
         features = np.concatenate(features_buffer, 0).astype(np.float32)
+        tsne = TSNE(n_components=2, perplexity=tsne_perplexity)
+        fs_tsne = tsne.fit_transform(features)
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        
+        df = pd.DataFrame({
+            **{f'pca{j}': fs_pca[:, j].reshape(-1) for j in range(fs_pca.shape[1])}, 
+            **{f'tsne{j}': fs_tsne[:, j].reshape(-1) for j in range(fs_tsne.shape[1])},
+            'impath': filenames, 
+            'action': actions_buffer
+        })
+        df.to_csv("atari_viz_data.csv")
+        
         kmeans = faiss.Kmeans(
             features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
         )
@@ -278,47 +311,47 @@ class Trainer:
         labels = kmeans.index.search(features, 1)[1].reshape(-1)
         visit_probs = self.transition_probs(labels)
         
-        pca = PCA(n_components=2)
-        fs_pca = pca.fit_transform(features)
-        cen_pca = pca.transform(centroids)
+        
+        
+        # cen_pca = pca.transform(centroids)
         
         # PCA sanity check
-        pca2 = PCA(n_components=100)
-        pca2.fit(features)
-        expvars = pca2.explained_variance_ratio_ * 100
-        cumsum = [sum(expvars[:i]) for i in range(1, len(expvars))]
+        # pca2 = PCA(n_components=100)
+        # pca2.fit(features)
+        # expvars = pca2.explained_variance_ratio_ * 100
+        # cumsum = [sum(expvars[:i]) for i in range(1, len(expvars))]
         
-        plt.figure(figsize=(8, 6))
-        plt.plot(cumsum, linewidth=2, color='b')
-        plt.grid(alpha=0.4)
-        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'pca_variance_cumsum.png'))
+        # plt.figure(figsize=(8, 6))
+        # plt.plot(cumsum, linewidth=2, color='b')
+        # plt.grid(alpha=0.4)
+        # plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'pca_variance_cumsum.png'))
         
         plt.figure(figsize=(16, 8))
         plt.subplot(121)
         plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.1)
-        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=80, edgecolors='k')
+        # plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=80, edgecolors='k')
         
-        for name, val in visit_probs.items():
-            s, s_ = [int(j) for j in name.split('_')]
-            cen1, cen2 = cen_pca[s], cen_pca[s_]
-            plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k')
+        # for name, val in visit_probs.items():
+        #     s, s_ = [int(j) for j in name.split('_')]
+        #     cen1, cen2 = cen_pca[s], cen_pca[s_]
+        #     plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k')
             
         plt.grid(alpha=0.3)
         plt.title('Clustering by distance', fontsize=15)
         
         plt.subplot(122)
         plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=actions_buffer, s=20, alpha=0.1)
-        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=80, edgecolors='k')
+        # plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=80, edgecolors='k')
         
-        for name, val in visit_probs.items():
-            s, s_ = [int(j) for j in name.split('_')]
-            cen1, cen2 = cen_pca[s], cen_pca[s_]
-            plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k')
+        # for name, val in visit_probs.items():
+        #     s, s_ = [int(j) for j in name.split('_')]
+        #     cen1, cen2 = cen_pca[s], cen_pca[s_]
+        #     plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k')
         
         plt.grid(alpha=0.3)
         plt.title('Clustering by action', fontsize=15)
         plt.tight_layout()
-        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'100episodes.png'))
+        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'10episodes_perp={tsne_perplexity}.png'))
         plt.close()
         
     @torch.no_grad()
@@ -786,7 +819,7 @@ if __name__ == "__main__":
     parser = cli_args.add_atari_args(parser)
     args = parser.parse_args()
     
-    trainer = AttentionTrainer(args)
+    trainer = Trainer(args)
     
     if args.task == 'train':
         trainer.run()
@@ -797,4 +830,4 @@ if __name__ == "__main__":
         
     elif args.task == 'mdp':
         assert args.load is not None, 'Model checkpoint required for MDP creation'
-        trainer.convert_to_mdp()
+        trainer.convert_to_mdp(20)

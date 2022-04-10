@@ -7,6 +7,7 @@ import wandb
 import torch
 import faiss
 import random
+import shutil
 import argparse
 import numpy as np
 import pandas as pd
@@ -17,8 +18,10 @@ import matplotlib.animation as animation
 
 from tqdm import tqdm
 from envs import env
+from PIL import Image
 from agents import dqn 
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 from datetime import datetime as dt
 from utils import common, memory, cli_args
 from gym.wrappers.monitoring.video_recorder import VideoRecorder
@@ -262,7 +265,7 @@ class Trainer:
         total_rewards = []
         images = []
             
-        for j in range(self.args.eval_episodes):
+        for j in range(self.args.spectator_episodes):
             episode_done = False
             total_reward = 0
             
@@ -314,19 +317,29 @@ class Trainer:
         
     @torch.no_grad()
     def convert_to_mdp(self):
+        if not os.path.exists('assets'):
+            os.makedirs('assets')
+        
+        if len(os.listdir('assets')) > 0:
+            shutil.rmtree('assets')
+            os.makedirs('assets')
+        
         os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
         self.agent.trainable(False)
         features_buffer = []
         actions_buffer = []
+        filenames = []
+        count = 0
 
-        for _ in tqdm(range(100)):        
+        for _ in tqdm(range(20)):        
             episode_done = False 
             total_reward = 0
             step = 0
             
             self.env.new_episode()
             while not episode_done:
-                obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                frames = [self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)]
+                obs = self._warp(frames)
                 action = self.agent.select_action(obs)
                 reward = self.env.make_action(self.actions[action], self.args.frame_skip)
                 done = int(self.env.is_episode_finished())
@@ -337,6 +350,11 @@ class Trainer:
                 features_buffer.append(state_fs)
                 actions_buffer.append(action)
                 
+                frame_img = Image.fromarray(frames[-1])
+                frame_img.save(f'assets/{count}.png', format='PNG')
+                filenames.append(f'{count}.png')
+                count += 1
+                
                 if not done:
                     next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
                 else:
@@ -344,6 +362,19 @@ class Trainer:
                     episode_done = True
                     
         features = np.concatenate(features_buffer, 0).astype(np.float32)
+        tsne = TSNE(n_components=2, perplexity=50)
+        fs_tsne = tsne.fit_transform(features)
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        
+        df = pd.DataFrame({
+            **{f'pca{j}': fs_pca[:, j].reshape(-1) for j in range(fs_pca.shape[1])},
+            **{f'tsne{j}': fs_tsne[:, j].reshape(-1) for j in range(fs_tsne.shape[1])}, 
+            'impath': filenames, 
+            'action': actions_buffer
+        })
+        df.to_csv("vizdoom_viz_data.csv")
+        
         kmeans = faiss.Kmeans(
             features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
         )
@@ -352,30 +383,28 @@ class Trainer:
         labels = kmeans.index.search(features, 1)[1].reshape(-1)
         visit_probs = self.transition_probs(labels)
         
-        pca = PCA(n_components=2)
-        fs_pca = pca.fit_transform(features)
-        cen_pca = pca.transform(centroids)
+        # cen_pca = pca.fit_transform(centroids)
         
         # PCA sanity check
-        pca2 = PCA(n_components=10)
-        pca2.fit(features)
-        expvars = pca2.explained_variance_ratio_ * 100
-        cumsum = [sum(expvars[:i]) for i in range(1, len(expvars))]
+        # pca2 = PCA(n_components=10)
+        # pca2.fit(features)
+        # expvars = pca2.explained_variance_ratio_ * 100
+        # cumsum = [sum(expvars[:i]) for i in range(1, len(expvars))]
         
-        plt.figure(figsize=(8, 6))
-        plt.plot(cumsum, linewidth=2, color='b')
-        plt.grid(alpha=0.4)
-        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'pca_variance_cumsum.png'))
+        # plt.figure(figsize=(8, 6))
+        # plt.plot(cumsum, linewidth=2, color='b')
+        # plt.grid(alpha=0.4)
+        # plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'pca_variance_cumsum.png'))
         
         plt.figure(figsize=(16, 8))
         plt.subplot(121)
         plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.4, cmap='Set1')
-        plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=120, edgecolors='k', cmap='Set1')
+        # plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=120, edgecolors='k', cmap='Set1')
         
-        for name, val in visit_probs.items():
-            s, s_ = [int(j) for j in name.split('_')]
-            cen1, cen2 = cen_pca[s], cen_pca[s_]
-            plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k', alpha=0.1)
+        # for name, val in visit_probs.items():
+        #     s, s_ = [int(j) for j in name.split('_')]
+        #     cen1, cen2 = cen_pca[s], cen_pca[s_]
+        #     plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k', alpha=0.1)
             
         plt.grid(alpha=0.3)
         plt.title('Clustering by distance', fontsize=15)
@@ -1261,7 +1290,7 @@ if __name__ == "__main__":
         
     elif args.task == 'mdp':
         assert args.load is not None, 'Model checkpoint required for generating MDP'
-        trainer.play_on_mdp()
+        trainer.convert_to_mdp()
         
     elif args.task == 'automap':
         assert args.load is not None, 'Model checkpoint required for automap viz'

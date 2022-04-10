@@ -94,7 +94,7 @@ class PixelEncoder(nn.Module):
         x = self.relu(self.conv1(x))
         x = self.relu(self.conv2(x))
         x = self.relu(self.conv3(x))
-        fs = self.conv4(x)
+        fs = self.relu(self.conv4(x))
         pooled_fs = self.avgpool(fs)
         pooled_fs = torch.flatten(pooled_fs, 1)
         return pooled_fs, fs
