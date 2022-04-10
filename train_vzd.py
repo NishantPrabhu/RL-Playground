@@ -524,7 +524,516 @@ class Trainer:
             
             plt.tight_layout()
             plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'episode_play_{i}.png'))
-            plt.close()       
+            plt.close()      
+            
+            
+class ActionPredictionTrainer:
+    
+    def __init__(self, args, seed=0):
+        self.args = args 
+        common.print_args(args)
+        
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
+        self.env, self.actions, self.action_names = env.VizdoomEnv(
+            name=args.expt_name, 
+            screen_format=args.screen_format,
+            screen_res=args.screen_res
+        )
+        self.action_size = len(self.actions)
+        self.n_actions = len(self.actions[0])
+        
+        self.agent = dqn.GradientReversalDQN(
+            input_ch=args.frame_stack,
+            n_actions=self.action_size,
+            double_dqn=args.double_dqn,
+            dueling_dqn=args.dueling_dqn,
+            enc_hidden_ch=args.enc_hidden_ch,
+            enc_fdim=args.enc_fdim,
+            q_hidden_dim=args.q_hidden_dim,
+            gamma=args.gamma,
+            target_update_interval=args.target_update_interval,
+            learning_rate=args.learning_rate,
+            ap_learning_rate=args.ap_learning_rate,
+            max_grad_norm=args.max_grad_norm
+        )
+        self.memory = memory.ReplayMemory(
+            mem_size=args.replay_mem_size, 
+            obs_shape=(args.frame_height, args.frame_width, args.frame_stack)
+        )
+        
+        if args.load is not None:
+            self.agent.load(args.load)
+            self.out_dir = args.load
+        else:        
+            self.out_dir = os.path.join('out', 'vizdoom', args.expt_name, dt.now().strftime('%d-%m-%Y_%H-%M'))
+            os.makedirs(self.out_dir, exist_ok=True)
+            os.makedirs(os.path.join(self.out_dir, 'videos'), exist_ok=True)
+        
+        self.logger = common.Logger(self.out_dir)
+        self.log_wandb = False
+        if args.wandb:
+            wandb.init(project='rl-playground', name='{}_{}'.format(args.expt_name, dt.now().strftime('%d-%m-%Y_%H-%M')))
+            self.log_wandb = True
+            
+        if torch.cuda.is_available():
+            self.logger.print('Found GPU device: {}'.format(torch.cuda.get_device_name(0)), mode='info')
+        
+        self.batch_size = self.args.batch_size
+        self.best_train, self.best_val = 0, 0
+        
+    def _warp(self, frames):
+        if frames[0].ndim == 2:
+            frames = [np.expand_dims(f, -1) for f in frames]
+        elif frames[0].ndim == 3 and frames[0].shape[-1] > 1:
+            frames = [np.expand_dims(cv2.cvtColor(f, cv2.COLOR_RGB2GRAY), -1) for f in frames]
+            
+        obs = np.concatenate(frames, -1)
+        obs = cv2.resize(obs, (self.args.frame_width, self.args.frame_height), interpolation=cv2.INTER_AREA)
+        return obs
+        
+    def init_memory(self):
+        self.env.new_episode()
+        for step in range(self.args.mem_init_steps):
+            obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+            action = random.choice(np.arange(self.action_size))
+            reward = self.env.make_action(self.actions[action], self.args.frame_skip)
+            done = int(self.env.is_episode_finished())
+            if not done:
+                next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+            else:
+                next_obs = np.zeros_like(obs, dtype=np.uint8)
+                self.env.new_episode()
+            
+            self.memory.store(obs, action, reward, next_obs, done)
+            common.pbar((step+1)/self.args.mem_init_steps, desc='Progress', status='')
+            
+        total_loss = 0
+        random_steps = self.args.mem_init_steps // self.batch_size
+        for step in range(random_steps):
+            batch = self.memory.get_batch(self.batch_size)
+            loss = self.agent.learn_from_memory(batch)
+            total_loss += loss
+            common.pbar((step+1)/random_steps, desc="Learning", status='')
+        print()
+        avg_loss = total_loss / random_steps
+        self.logger.record('QL: {:.4f} | BEST_T: {}'.format(avg_loss, self.best_train), mode='train')
+        
+    def train_episode(self, episode):
+        self.agent.trainable(True)
+        meter = common.AverageMeter()
+        episode_done = False 
+        step = 0
+        
+        self.env.new_episode()
+        while not episode_done:
+            obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+            action = self.agent.select_action(obs)
+            reward = self.env.make_action(self.actions[action], self.args.frame_skip)
+            done = int(self.env.is_episode_finished())
+            if not done:
+                next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+            else:
+                next_obs = np.zeros_like(obs, dtype=np.uint8)
+                episode_done = True                
+            
+            self.memory.store(obs, action, reward, next_obs, done)
+            step += 1
+            
+            if step % self.args.mem_replay_interval == 0:
+                batch = self.memory.get_batch(self.batch_size)
+                loss = self.agent.update_q_networks(batch)
+                meter.add({'QL': loss})
+                
+        total_reward = self.env.get_total_reward()
+        if total_reward > self.best_train:
+            self.best_train = round(total_reward)
+            
+        if episode % self.args.log_interval == 0:
+            self.logger.record("E: {:7d} | R: {:4d} |{} BEST_T: {:3d} | BEST_V: {:3d} | EPS: {:.2f}".format(
+                episode, round(total_reward), meter.msg(), round(self.best_train), round(self.best_val), self.agent.eps),
+                mode='train'
+            )
+        if self.log_wandb:
+            wandb.log({'episode': episode, 'reward': total_reward, **meter.get()})
+
+    @torch.no_grad()
+    def evaluate(self, episode):
+        self.agent.trainable(False)
+        meter = common.AverageMeter()
+            
+        for _ in range(self.args.eval_episodes):
+            episode_done = False
+            total_reward = 0
+            
+            self.env.new_episode()
+            while not episode_done:
+                obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                action = self.agent.select_agent_action(obs)
+                reward = self.env.make_action(self.actions[action], self.args.frame_skip)
+                done = int(self.env.is_episode_finished())
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True 
+
+            total_reward = self.env.get_total_reward()
+            meter.add({'R': total_reward})
+                
+        avg_reward = meter.get()['R']
+        if avg_reward > self.best_val:
+            self.best_val = round(avg_reward)
+            self.agent.save(self.out_dir)
+              
+        self.logger.record("E: {:7d} | R: {:4d} | BEST_T: {:3d} | BEST_V: {:3d}".format(
+            episode, round(avg_reward), round(self.best_train), round(self.best_val)),
+            mode='val'
+        )
+        if self.log_wandb:
+            wandb.log({'episode': episode, 'val_reward': avg_reward})
+    
+    def run(self):
+        self.logger.print('Initializing memory', mode='info')
+        self.init_memory()
+        print()
+        self.logger.print('Beginning training', mode='info')
+        
+        for episode in range(1, self.args.train_episodes+1):
+            self.train_episode(episode)
+            if episode % self.args.eval_interval == 0:
+                self.evaluate(episode)
+            
+            if episode % self.args.ap_training_interval == 0:
+                meter = common.AverageMeter()
+                for step in range(self.args.ap_training_steps):
+                    batch = self.memory.get_batch(self.batch_size)
+                    loss = self.agent.update_encoder(batch)
+                    meter.add({'ap_loss': loss})
+                    common.pbar(
+                        (step+1)/self.args.ap_training_steps, desc=f'AP training {episode}', status=meter.msg()
+                    )
+                self.logger.write('AP training {} [loss] {:.4f}'.format(episode, meter.get()['ap_loss']), mode='train')
+                
+        self.logger.print('Completed training', mode='info')
+        
+    @torch.no_grad()
+    def create_video(self):
+        self.env.close()
+        self.env.set_window_visible(True)
+        self.env.set_mode(vzd.Mode.ASYNC_PLAYER)
+        self.env.init()
+        self.agent.trainable(False)
+        
+        for i in range(self.args.spectator_episodes):
+            self.env.new_episode(os.path.join(self.out_dir, 'videos', f'attempt_{i}.lmp'))
+            
+            while not self.env.is_episode_finished():
+                obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                action = self.agent.select_agent_action(obs)
+                reward = self.env.set_action(self.actions[action])
+                for _ in range(self.args.frame_skip):
+                    self.env.advance_action()
+                    
+            time.sleep(1.0)
+            total_reward = self.env.get_total_reward()
+            self.logger.print('E: {:7d} | R: {:4d}'.format(i+1, round(total_reward)))
+            
+        self.env.close()
+        
+    @torch.no_grad()
+    def automap_viz(self):
+        self.env.close()
+        self.env.set_mode(vzd.Mode.ASYNC_PLAYER)
+        self.env.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
+        self.env.set_screen_format(vzd.ScreenFormat.RGB24)
+        self.env.set_automap_buffer_enabled(True)
+        self.env.set_automap_mode(vzd.AutomapMode.OBJECTS_WITH_SIZE)
+        self.env.add_available_game_variable(vzd.GameVariable.POSITION_X)
+        self.env.add_available_game_variable(vzd.GameVariable.POSITION_Y)
+        self.env.add_available_game_variable(vzd.GameVariable.POSITION_Z)
+        self.env.set_window_visible(False)
+        self.env.add_game_args("+am_followplayer 1")
+        self.env.add_game_args("+viz_am_scale 10")
+        self.env.add_game_args("+viz_am_center 1")
+        self.env.add_game_args("+am_backcolor 000000")
+        self.env.add_game_args("+am_yourcolor ffff00")
+        self.env.add_game_args("+am_thingcolor_monster ff0000")
+        self.env.add_game_args("+am_thingcolor_item 00ff00")
+        self.env.init()
+        
+        self.agent.trainable(False)
+        meter = common.AverageMeter()
+        fig, axarr = plt.subplots(1, 2, figsize=(10, 4))
+        total_rewards = []
+        images = []
+            
+        for j in range(self.args.spectator_episodes):
+            episode_done = False
+            total_reward = 0
+            
+            self.env.new_episode()
+            while not episode_done:
+                obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                action = self.agent.select_agent_action(obs)
+                reward = self.env.set_action(self.actions[action])
+                
+                for _ in range(self.args.frame_skip):
+                    self.env.advance_action()
+                    if not int(self.env.is_episode_finished()):
+                        im1 = axarr[0].imshow(self.env.get_state().screen_buffer, cmap='gray')
+                        axarr[0].axis('off')
+                        im2 = axarr[1].imshow(self.env.get_state().automap_buffer, cmap='gray')
+                        axarr[1].axis('off')
+                        images.append([im1, im2])
+                        
+                done = int(self.env.is_episode_finished())
+                    
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True
+
+            total_rewards.append(self.env.get_total_reward())
+            print(f"Episode {j+1}: Total reward = {self.env.get_total_reward()}")
+            
+        anim = animation.ArtistAnimation(fig, images, interval=10000, blit=True)
+        anim.save(os.path.join(self.out_dir, 'videos', 'automap_viz.mp4'.format(np.mean(total_rewards))), fps=24)            
+        
+    def transition_probs(self, labels):
+        visit_probs = {}
+        n_txn = 0
+
+        for i in range(0, len(labels)-1):
+            s, s_ = labels[i], labels[i+1]
+            name = f'{s}_{s_}'
+            n_txn += 1
+            
+            if name not in visit_probs:
+                visit_probs[name] = 1
+            else:
+                visit_probs[name] += 1
+            
+        visit_probs = {k: v/n_txn for k, v in visit_probs.items()}
+        return visit_probs        
+        
+    @torch.no_grad()
+    def convert_to_mdp(self):
+        if not os.path.exists('assets'):
+            os.makedirs('assets')
+        
+        if len(os.listdir('assets')) > 0:
+            shutil.rmtree('assets')
+            os.makedirs('assets')
+        
+        os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
+        self.agent.trainable(False)
+        features_buffer = []
+        actions_buffer = []
+        filenames = []
+        count = 0
+
+        for _ in tqdm(range(20)):        
+            episode_done = False 
+            total_reward = 0
+            step = 0
+            
+            self.env.new_episode()
+            while not episode_done:
+                frames = [self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)]
+                obs = self._warp(frames)
+                action = self.agent.select_action(obs)
+                reward = self.env.make_action(self.actions[action], self.args.frame_skip)
+                done = int(self.env.is_episode_finished())
+                step += 1
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy()
+                features_buffer.append(state_fs)
+                actions_buffer.append(action)
+                
+                frame_img = Image.fromarray(frames[-1])
+                frame_img.save(f'assets/{count}.png', format='PNG')
+                filenames.append(f'{count}.png')
+                count += 1
+                
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True
+                    
+        features = np.concatenate(features_buffer, 0).astype(np.float32)
+        tsne = TSNE(n_components=2, perplexity=50)
+        fs_tsne = tsne.fit_transform(features)
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        
+        df = pd.DataFrame({
+            **{f'pca{j}': fs_pca[:, j].reshape(-1) for j in range(fs_pca.shape[1])},
+            **{f'tsne{j}': fs_tsne[:, j].reshape(-1) for j in range(fs_tsne.shape[1])}, 
+            'impath': filenames, 
+            'action': actions_buffer
+        })
+        df.to_csv("vizdoom_viz_data.csv")
+        
+        kmeans = faiss.Kmeans(
+            features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
+        )
+        _ = kmeans.train(features)
+        centroids = kmeans.centroids
+        labels = kmeans.index.search(features, 1)[1].reshape(-1)
+        visit_probs = self.transition_probs(labels)
+        
+        # cen_pca = pca.fit_transform(centroids)
+        
+        # PCA sanity check
+        # pca2 = PCA(n_components=10)
+        # pca2.fit(features)
+        # expvars = pca2.explained_variance_ratio_ * 100
+        # cumsum = [sum(expvars[:i]) for i in range(1, len(expvars))]
+        
+        # plt.figure(figsize=(8, 6))
+        # plt.plot(cumsum, linewidth=2, color='b')
+        # plt.grid(alpha=0.4)
+        # plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'pca_variance_cumsum.png'))
+        
+        plt.figure(figsize=(16, 8))
+        plt.subplot(121)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.4, cmap='Set1')
+        # plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=120, edgecolors='k', cmap='Set1')
+        
+        # for name, val in visit_probs.items():
+        #     s, s_ = [int(j) for j in name.split('_')]
+        #     cen1, cen2 = cen_pca[s], cen_pca[s_]
+        #     plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k', alpha=0.1)
+            
+        plt.grid(alpha=0.3)
+        plt.title('Clustering by distance', fontsize=15)
+        
+        plt.subplot(122)
+        plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=actions_buffer, s=20, alpha=0.4, cmap='Set1')
+        # plt.scatter(cen_pca[:, 0], cen_pca[:, 1], c=[i for i in range(centroids.shape[0])], s=120, edgecolors='k', cmap='Set1')
+        
+        # for name, val in visit_probs.items():
+        #     s, s_ = [int(j) for j in name.split('_')]
+        #     cen1, cen2 = cen_pca[s], cen_pca[s_]
+        #     plt.plot([cen1[0], cen2[0]], [cen1[1], cen2[1]], color='k', alpha=0.1)
+        
+        plt.grid(alpha=0.3)
+        plt.title('Clustering by action', fontsize=15)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'100episodes.png'))
+        plt.close()
+        
+    @torch.no_grad()
+    def play_on_mdp(self):
+        os.makedirs(os.path.join(self.out_dir, 'mdp_viz'), exist_ok=True)
+        self.agent.trainable(False)
+        features_buffer = []
+        actions_buffer = []
+
+        for _ in tqdm(range(100)):        
+            episode_done = False 
+            total_reward = 0
+            step = 0
+            
+            self.env.new_episode()
+            while not episode_done:
+                obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                action = self.agent.select_action(obs)
+                reward = self.env.set_action(self.actions[action])
+                for _ in range(self.args.frame_skip):
+                    self.env.advance_action()
+                done = int(self.env.is_episode_finished())
+                step += 1
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy()
+                features_buffer.append(state_fs)
+                actions_buffer.append(action)
+                
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True
+                    
+        features = np.concatenate(features_buffer, 0).astype(np.float32)
+        kmeans = faiss.Kmeans(
+            features.shape[1], self.n_actions, niter=20, verbose=False, gpu=torch.cuda.is_available()
+        )
+        _ = kmeans.train(features)
+        centroids = kmeans.centroids
+        labels = kmeans.index.search(features, 1)[1].reshape(-1)
+        
+        pca = PCA(n_components=2)
+        fs_pca = pca.fit_transform(features)
+        cen_pca = pca.transform(centroids)
+        
+        labels_, obses = [], []
+        rewards, q_preds = [], []
+        
+        for _ in range(5):
+            episode_done = False 
+            
+            self.env.new_episode()
+            while not episode_done:
+                frames = [self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)]
+                obs = self._warp(frames)
+                action = self.agent.select_action(obs)
+                reward = self.env.make_action(self.actions[action], self.args.frame_skip)
+                done = int(self.env.is_episode_finished())
+                rewards.append(reward)
+                
+                state_fs, _ = self.agent.online_q.encoder(self.agent.preprocess_obs(obs))
+                state_fs = state_fs.detach().cpu().numpy().astype(np.float32)
+                q_pred = self.agent.online_q(self.agent.preprocess_obs(obs))[0].detach().cpu().numpy().reshape(-1,)[action]
+                q_preds.append(q_pred)
+                label = kmeans.index.search(state_fs, 1)[1].item()
+                labels_.append(label)
+                obses.append(frames[-1])
+                
+                if not done:
+                    next_obs = self._warp([self.env.get_state().screen_buffer for _ in range(self.args.frame_stack)])
+                else:
+                    next_obs = np.zeros_like(obs, dtype=np.uint8)
+                    episode_done = True
+                    
+        discounted_sum = lambda seq: sum([seq[i] * self.args.gamma ** i for i in range(len(seq))])
+        returns = [discounted_sum(rewards[j:]) for j in range(len(rewards))]
+        
+        for i in range(len(labels_)):
+            plt.figure(figsize=(24, 8))
+            plt.subplot(131)
+            plt.scatter(fs_pca[:, 0], fs_pca[:, 1], c=labels, s=20, alpha=0.4, cmap='Set1')
+            plt.scatter(cen_pca[:, 0], cen_pca[:, 1], 
+                        c=np.arange(centroids.shape[0]), 
+                        s=[500 if j == labels_[i] else 120 for j in range(centroids.shape[0])], 
+                        edgecolors='k', 
+                        cmap='Set1')
+            plt.grid(alpha=0.3)
+            
+            plt.subplot(132)
+            plt.imshow(obses[i], cmap='gray')
+            plt.axis('off')
+            
+            plt.subplot(133)
+            plt.plot(returns[:i], color='b', linewidth=2, label='Actual discounted return')
+            plt.plot(q_preds[:i], color='r', linewidth=2, label='Predicted return')
+            plt.grid(alpha=0.4)
+            plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.out_dir, 'mdp_viz', f'episode_play_{i}.png'))
+            plt.close()  
         
         
 class ClusteringTrainer:
@@ -1271,7 +1780,7 @@ if __name__ == "__main__":
     parser = cli_args.add_vizdoom_args(parser)
     args = parser.parse_args()
     
-    trainer = Trainer(args)
+    trainer = ActionPredictionTrainer(args)
     
     if args.task == 'train':
         trainer.run()
